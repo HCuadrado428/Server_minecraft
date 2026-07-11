@@ -55,17 +55,15 @@ function recomputeVersionHash(modpackId) {
     return hash;
 }
 
-function hasAccess(modpackId, userUuid) {
-    const pack = db.prepare('SELECT owner_uuid FROM modpacks WHERE id = ?').get(modpackId);
-    if (!pack) return false;
-    if (pack.owner_uuid === userUuid) return true;
-    const row = db.prepare('SELECT 1 FROM access WHERE modpack_id = ? AND user_uuid = ?').get(modpackId, userUuid);
-    return !!row;
-}
-
+// Distinguimos "el modpack no existe" (404, p.ej. porque el creador lo
+// borró) de "el modpack existe pero no tienes acceso" (403). Esto es lo que
+// permite a los launchers detectar un borrado real cuando sincronizan.
 function requireAccess(req, res, next) {
-    if (!hasAccess(req.params.id, req.user.uuid)) {
-        return res.status(403).json({ error: 'No tienes acceso a este modpack. Pide un link de invitación al creador.' });
+    const pack = db.prepare('SELECT owner_uuid FROM modpacks WHERE id = ?').get(req.params.id);
+    if (!pack) return res.status(404).json({ error: 'Modpack no encontrado.' });
+    if (pack.owner_uuid !== req.user.uuid) {
+        const row = db.prepare('SELECT 1 FROM access WHERE modpack_id = ? AND user_uuid = ?').get(req.params.id, req.user.uuid);
+        if (!row) return res.status(403).json({ error: 'No tienes acceso a este modpack. Pide un link de invitación al creador.' });
     }
     next();
 }
@@ -81,22 +79,25 @@ function requireOwner(req, res, next) {
 
 router.use(requireAuth);
 
+const LOADERS = ['vanilla', 'forge', 'fabric'];
+
 // --- Crear modpack ---
 router.post('/', (req, res) => {
     const { name, mc_version } = req.body;
+    const loader = LOADERS.includes(req.body.loader) ? req.body.loader : 'vanilla';
     if (!name || !mc_version) return res.status(400).json({ error: 'Faltan "name" o "mc_version".' });
 
     const id = crypto.randomUUID();
     const now = Date.now();
     db.prepare(`
-        INSERT INTO modpacks (id, name, mc_version, owner_uuid, version_hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, '', ?, ?)
-    `).run(id, name, mc_version, req.user.uuid, now, now);
+        INSERT INTO modpacks (id, name, mc_version, loader, owner_uuid, version_hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, '', ?, ?)
+    `).run(id, name, mc_version, loader, req.user.uuid, now, now);
 
     db.prepare('INSERT INTO access (modpack_id, user_uuid, granted_at) VALUES (?, ?, ?)')
         .run(id, req.user.uuid, now);
 
-    res.json({ id, name, mc_version, owner_uuid: req.user.uuid, version_hash: '' });
+    res.json({ id, name, mc_version, loader, owner_uuid: req.user.uuid, version_hash: '' });
 });
 
 // --- Mis modpacks (los que creé + los que me han compartido) ---
@@ -123,6 +124,7 @@ router.get('/:id/manifest', requireAccess, (req, res) => {
         id: pack.id,
         name: pack.name,
         mc_version: pack.mc_version,
+        loader: pack.loader,
         version_hash: pack.version_hash,
         mods
     });
@@ -182,6 +184,20 @@ router.post('/:id/invite', requireOwner, (req, res) => {
     `).run(token, req.params.id, req.user.uuid, max_uses || null, expiresAt, now);
 
     res.json({ token, url: `milauncher://invite/${token}` });
+});
+
+// --- Eliminar modpack (solo el dueño) ---
+// Borra en cascada mods/invitaciones/accesos y los archivos en disco. A
+// partir de aquí, cualquier launcher que intente sincronizar este modpack
+// recibirá un 404 (ver requireAccess) y limpiará su instalación local.
+router.delete('/:id', requireOwner, (req, res) => {
+    const id = req.params.id;
+    db.prepare('DELETE FROM mods WHERE modpack_id = ?').run(id);
+    db.prepare('DELETE FROM invites WHERE modpack_id = ?').run(id);
+    db.prepare('DELETE FROM access WHERE modpack_id = ?').run(id);
+    db.prepare('DELETE FROM modpacks WHERE id = ?').run(id);
+    fs.rm(modpackDir(id), { recursive: true, force: true }, () => {});
+    res.json({ ok: true });
 });
 
 module.exports = router;

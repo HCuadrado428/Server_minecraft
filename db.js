@@ -58,4 +58,14 @@ CREATE TABLE IF NOT EXISTS access (
 );
 `);
 
+// Migración no destructiva: añade columnas nuevas a bases de datos que ya
+// existían antes de introducir esa columna, sin tocar los datos existentes.
+function ensureColumn(table, column, definitionSql) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!cols.some((c) => c.name === column)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definitionSql}`);
+    }
+}
+ensureColumn('modpacks', 'loader', "TEXT NOT NULL DEFAULT 'vanilla'");
+
 module.exports = db;
