@@ -17,6 +17,9 @@ function ensureDir(dir) {
     fs.mkdirSync(dir, { recursive: true });
 }
 
+const MOD_TYPES = ['mod', 'resourcepack'];
+const EXTENSION_BY_TYPE = { mod: '.jar', resourcepack: '.zip' };
+
 const upload = multer({
     storage: multer.diskStorage({
         destination: (req, file, cb) => {
@@ -25,12 +28,20 @@ const upload = multer({
             cb(null, dir);
         },
         filename: (req, file, cb) => {
-            // Conservamos el nombre original del jar, quitando caracteres raros
+            // Conservamos el nombre original del archivo, quitando caracteres raros
             const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
             cb(null, Date.now() + '-' + safe);
         }
     }),
-    limits: { fileSize: 512 * 1024 * 1024 } // 512MB por archivo, de sobra para un mod
+    fileFilter: (req, file, cb) => {
+        const type = MOD_TYPES.includes(req.body.type) ? req.body.type : 'mod';
+        const expectedExt = EXTENSION_BY_TYPE[type];
+        if (!file.originalname.toLowerCase().endsWith(expectedExt)) {
+            return cb(new Error(`Se esperaba un archivo ${expectedExt} para el tipo "${type}".`));
+        }
+        cb(null, true);
+    },
+    limits: { fileSize: 512 * 1024 * 1024 } // 512MB por archivo, de sobra para un mod o resource pack
 });
 
 function sha1File(filePath) {
@@ -125,7 +136,7 @@ router.get('/mine', (req, res) => {
 router.get('/:id/manifest', requireAccess, (req, res) => {
     const pack = db.prepare('SELECT * FROM modpacks WHERE id = ?').get(req.params.id);
     if (!pack) return res.status(404).json({ error: 'Modpack no encontrado.' });
-    const mods = db.prepare('SELECT id, filename, filesize, sha1 FROM mods WHERE modpack_id = ?').all(pack.id);
+    const mods = db.prepare('SELECT id, filename, filesize, sha1, type FROM mods WHERE modpack_id = ?').all(pack.id);
     res.json({
         id: pack.id,
         name: pack.name,
@@ -137,20 +148,24 @@ router.get('/:id/manifest', requireAccess, (req, res) => {
     });
 });
 
-// --- Añadir mod (solo el dueño) ---
+// --- Añadir mod o resource pack (solo el dueño) ---
+// El campo "type" debe ir ANTES del archivo en el FormData: multer procesa
+// el multipart en orden y solo los campos ya vistos están en req.body
+// cuando se ejecuta fileFilter.
 router.post('/:id/mods', requireOwner, upload.single('mod'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Falta el archivo del mod (campo "mod").' });
+    const type = MOD_TYPES.includes(req.body.type) ? req.body.type : 'mod';
 
     try {
         const sha1 = await sha1File(req.file.path);
         const modId = crypto.randomUUID();
         db.prepare(`
-            INSERT INTO mods (id, modpack_id, filename, filesize, sha1, added_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `).run(modId, req.params.id, req.file.filename, req.file.size, sha1, Date.now());
+            INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(modId, req.params.id, req.file.filename, req.file.size, sha1, type, Date.now());
 
         const versionHash = recomputeVersionHash(req.params.id);
-        res.json({ id: modId, filename: req.file.filename, filesize: req.file.size, sha1, version_hash: versionHash });
+        res.json({ id: modId, filename: req.file.filename, filesize: req.file.size, sha1, type, version_hash: versionHash });
     } catch (err) {
         console.error('[ERROR] al procesar el mod subido:', err);
         res.status(500).json({ error: 'No se pudo procesar el archivo subido.' });
