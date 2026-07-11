@@ -67,5 +67,6 @@ function ensureColumn(table, column, definitionSql) {
     }
 }
 ensureColumn('modpacks', 'loader', "TEXT NOT NULL DEFAULT 'vanilla'");
+ensureColumn('modpacks', 'loader_version', "TEXT NOT NULL DEFAULT ''");
 
 module.exports = db;

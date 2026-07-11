@@ -85,19 +85,25 @@ const LOADERS = ['vanilla', 'forge', 'fabric'];
 router.post('/', (req, res) => {
     const { name, mc_version } = req.body;
     const loader = LOADERS.includes(req.body.loader) ? req.body.loader : 'vanilla';
+    // La versión del loader es opcional: si no se manda (o el loader es
+    // vanilla), el launcher resolverá la recomendada automáticamente al
+    // sincronizar.
+    const loaderVersion = loader !== 'vanilla' && typeof req.body.loader_version === 'string'
+        ? req.body.loader_version.trim()
+        : '';
     if (!name || !mc_version) return res.status(400).json({ error: 'Faltan "name" o "mc_version".' });
 
     const id = crypto.randomUUID();
     const now = Date.now();
     db.prepare(`
-        INSERT INTO modpacks (id, name, mc_version, loader, owner_uuid, version_hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, '', ?, ?)
-    `).run(id, name, mc_version, loader, req.user.uuid, now, now);
+        INSERT INTO modpacks (id, name, mc_version, loader, loader_version, owner_uuid, version_hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)
+    `).run(id, name, mc_version, loader, loaderVersion, req.user.uuid, now, now);
 
     db.prepare('INSERT INTO access (modpack_id, user_uuid, granted_at) VALUES (?, ?, ?)')
         .run(id, req.user.uuid, now);
 
-    res.json({ id, name, mc_version, loader, owner_uuid: req.user.uuid, version_hash: '' });
+    res.json({ id, name, mc_version, loader, loader_version: loaderVersion, owner_uuid: req.user.uuid, version_hash: '' });
 });
 
 // --- Mis modpacks (los que creé + los que me han compartido) ---
@@ -125,6 +131,7 @@ router.get('/:id/manifest', requireAccess, (req, res) => {
         name: pack.name,
         mc_version: pack.mc_version,
         loader: pack.loader,
+        loader_version: pack.loader_version || '',
         version_hash: pack.version_hash,
         mods
     });
