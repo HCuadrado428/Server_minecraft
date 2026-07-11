@@ -69,5 +69,9 @@ function ensureColumn(table, column, definitionSql) {
 ensureColumn('modpacks', 'loader', "TEXT NOT NULL DEFAULT 'vanilla'");
 ensureColumn('modpacks', 'loader_version', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('mods', 'type', "TEXT NOT NULL DEFAULT 'mod'");
+ensureColumn('mods', 'source', "TEXT NOT NULL DEFAULT 'upload'");
+ensureColumn('mods', 'download_url', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('mods', 'external_project_id', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('mods', 'external_version_id', "TEXT NOT NULL DEFAULT ''");
 
 module.exports = db;

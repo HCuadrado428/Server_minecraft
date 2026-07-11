@@ -136,7 +136,7 @@ router.get('/mine', (req, res) => {
 router.get('/:id/manifest', requireAccess, (req, res) => {
     const pack = db.prepare('SELECT * FROM modpacks WHERE id = ?').get(req.params.id);
     if (!pack) return res.status(404).json({ error: 'Modpack no encontrado.' });
-    const mods = db.prepare('SELECT id, filename, filesize, sha1, type FROM mods WHERE modpack_id = ?').all(pack.id);
+    const mods = db.prepare('SELECT id, filename, filesize, sha1, type, source, download_url FROM mods WHERE modpack_id = ?').all(pack.id);
     res.json({
         id: pack.id,
         name: pack.name,
@@ -170,6 +170,47 @@ router.post('/:id/mods', requireOwner, upload.single('mod'), async (req, res) =>
         console.error('[ERROR] al procesar el mod subido:', err);
         res.status(500).json({ error: 'No se pudo procesar el archivo subido.' });
     }
+});
+
+// --- Añadir mod/resource pack desde Modrinth (solo el dueño) ---
+// El cliente solo manda IDs; nunca confiamos en nombre/tamaño/hash que venga
+// del launcher. Volvemos a pedirle los datos reales a la API de Modrinth
+// (pública, sin key) y guardamos eso.
+router.post('/:id/mods/from-modrinth', requireOwner, async (req, res) => {
+    const { project_id, version_id } = req.body || {};
+    const type = MOD_TYPES.includes(req.body.type) ? req.body.type : 'mod';
+    if (!project_id || !version_id) return res.status(400).json({ error: 'Faltan "project_id" o "version_id".' });
+
+    let version;
+    try {
+        const modrinthRes = await fetch(`https://api.modrinth.com/v2/version/${encodeURIComponent(version_id)}`, {
+            headers: { 'User-Agent': 'EmberLauncher/1.0 (github.com/HCuadrado428/Launcher)' }
+        });
+        if (!modrinthRes.ok) return res.status(400).json({ error: `Modrinth respondió con estado ${modrinthRes.status} al consultar la versión.` });
+        version = await modrinthRes.json();
+    } catch (err) {
+        console.error('[ERROR] al consultar Modrinth:', err);
+        return res.status(502).json({ error: 'No se pudo contactar con Modrinth.' });
+    }
+
+    if (version.project_id !== project_id) {
+        return res.status(400).json({ error: 'El project_id no coincide con la versión indicada.' });
+    }
+    const file = version.files.find((f) => f.primary) || version.files[0];
+    if (!file) return res.status(400).json({ error: 'Esa versión de Modrinth no tiene ningún archivo descargable.' });
+
+    const existing = db.prepare('SELECT id FROM mods WHERE modpack_id = ? AND external_project_id = ? AND source = ?')
+        .get(req.params.id, project_id, 'modrinth');
+    if (existing) return res.status(409).json({ error: 'Ese mod de Modrinth ya está en el modpack.' });
+
+    const modId = crypto.randomUUID();
+    db.prepare(`
+        INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, source, download_url, external_project_id, external_version_id, added_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'modrinth', ?, ?, ?, ?)
+    `).run(modId, req.params.id, file.filename, file.size, file.hashes.sha1, type, file.url, project_id, version_id, Date.now());
+
+    const versionHash = recomputeVersionHash(req.params.id);
+    res.json({ id: modId, filename: file.filename, filesize: file.size, sha1: file.hashes.sha1, type, source: 'modrinth', version_hash: versionHash });
 });
 
 // --- Quitar mod (solo el dueño) ---
