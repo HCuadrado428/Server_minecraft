@@ -5,7 +5,9 @@ const modpackRoutes = require('./routes/modpackRoutes');
 const inviteRoutes = require('./routes/inviteRoutes');
 
 const app = express();
-app.use(express.json());
+// El límite por defecto (100kb) se queda corto para la portada de un
+// modpack, que viaja como data URI en base64 dentro del JSON.
+app.use(express.json({ limit: '1mb' }));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 

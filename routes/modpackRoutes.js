@@ -234,6 +234,27 @@ router.get('/:id/mods/:modId/download', requireAccess, (req, res) => {
     res.download(filePath, mod.filename);
 });
 
+// --- Cambiar la portada de un modpack (solo el dueño) ---
+// Se manda como data URI base64 dentro del JSON (nada de subida de archivo
+// aparte): más simple de servir después, ya que "SELECT *" ya la incluye en
+// /mine y /manifest sin tener que montar una ruta estática nueva.
+router.put('/:id/cover', requireOwner, (req, res) => {
+    const { cover_image } = req.body || {};
+    if (typeof cover_image !== 'string') {
+        return res.status(400).json({ error: 'Falta "cover_image".' });
+    }
+    if (cover_image && !cover_image.startsWith('data:image/')) {
+        return res.status(400).json({ error: 'La portada debe ser una imagen.' });
+    }
+    if (cover_image.length > 350000) {
+        return res.status(413).json({ error: 'La imagen es demasiado grande. Prueba con una más pequeña.' });
+    }
+
+    db.prepare('UPDATE modpacks SET cover_image = ?, updated_at = ? WHERE id = ?')
+        .run(cover_image, Date.now(), req.params.id);
+    res.json({ ok: true });
+});
+
 // --- Crear link de invitación (solo el dueño) ---
 router.post('/:id/invite', requireOwner, (req, res) => {
     const { max_uses, expires_in_hours } = req.body || {};
