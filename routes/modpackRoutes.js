@@ -4,6 +4,7 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const AdmZip = require('adm-zip');
 const db = require('../db');
 const { requireAuth } = require('../auth');
 
@@ -43,6 +44,73 @@ const upload = multer({
     },
     limits: { fileSize: 512 * 1024 * 1024 } // 512MB por archivo, de sobra para un mod o resource pack
 });
+
+// Sin esto, cualquier cuenta autenticada podía subir archivos de hasta
+// 512MB sin límite de cantidad ni de total acumulado, llenando el disco del
+// servidor Railway. MAX_MODS_PER_MODPACK evita además manifiestos gigantes
+// que tardarían cada vez más en sincronizar en cada launcher.
+const MAX_BYTES_PER_OWNER = 5 * 1024 * 1024 * 1024; // 5GB en total, sumando todos los modpacks de un mismo creador
+const MAX_MODS_PER_MODPACK = 300;
+
+function getOwnerStorageBytes(ownerUuid) {
+    const row = db.prepare(`
+        SELECT COALESCE(SUM(mo.filesize), 0) AS total
+        FROM mods mo
+        INNER JOIN modpacks mp ON mp.id = mo.modpack_id
+        WHERE mp.owner_uuid = ?
+    `).get(ownerUuid);
+    return row.total;
+}
+
+function enforceModCountLimit(req, res, next) {
+    const modCount = db.prepare('SELECT COUNT(*) AS c FROM mods WHERE modpack_id = ?').get(req.params.id).c;
+    if (modCount >= MAX_MODS_PER_MODPACK) {
+        return res.status(413).json({ error: `Este modpack ya tiene el máximo de ${MAX_MODS_PER_MODPACK} archivos.` });
+    }
+    next();
+}
+
+function enforceUploadQuota(req, res, next) {
+    if (getOwnerStorageBytes(req.user.uuid) >= MAX_BYTES_PER_OWNER) {
+        return res.status(413).json({ error: 'Has alcanzado tu límite de almacenamiento (5GB en total entre todos tus modpacks). Borra algún mod para liberar espacio.' });
+    }
+    enforceModCountLimit(req, res, next);
+}
+
+// Intenta leer el identificador real del mod (modid) desde los metadatos que
+// trae el propio .jar, para poder avisar si dos mods del mismo modpack
+// proveen el mismo mod (p.ej. el mismo mod subido dos veces con nombres de
+// archivo distintos, o una versión vieja y una nueva sin borrar la anterior).
+// Si el jar no tiene ninguno de los formatos conocidos o está corrupto, no
+// bloqueamos la subida: simplemente no se guarda identificador.
+function extractModId(jarPath) {
+    try {
+        const zip = new AdmZip(jarPath);
+
+        const fabricEntry = zip.getEntry('fabric.mod.json');
+        if (fabricEntry) {
+            const json = JSON.parse(zip.readAsText(fabricEntry));
+            if (json && typeof json.id === 'string' && json.id) return json.id;
+        }
+
+        const forgeEntry = zip.getEntry('META-INF/mods.toml');
+        if (forgeEntry) {
+            const text = zip.readAsText(forgeEntry);
+            const match = text.match(/modId\s*=\s*"([^"]+)"/);
+            if (match) return match[1];
+        }
+
+        const oldForgeEntry = zip.getEntry('mcmod.info');
+        if (oldForgeEntry) {
+            const parsed = JSON.parse(zip.readAsText(oldForgeEntry));
+            const list = Array.isArray(parsed) ? parsed : parsed.modList;
+            if (Array.isArray(list) && list[0] && typeof list[0].modid === 'string') return list[0].modid;
+        }
+    } catch (err) {
+        // Jar corrupto o formato de metadatos no reconocido: no es un error fatal.
+    }
+    return null;
+}
 
 function sha1File(filePath) {
     return new Promise((resolve, reject) => {
@@ -92,9 +160,18 @@ router.use(requireAuth);
 
 const LOADERS = ['vanilla', 'forge', 'fabric'];
 
+// Cubre versiones release ("1.21.1"), pre-release/candidate ("1.21-pre1",
+// "1.21-rc1") y snapshots ("24w14a"). No es exhaustivo al 100% frente al
+// manifiesto real de Mojang, pero rechaza de entrada la basura obvia (vacío,
+// con espacios, con HTML, etc.) en vez de que el error aparezca mucho más
+// tarde y de forma confusa dentro del instalador del launcher.
+const MC_VERSION_RE = /^([0-9]+\.[0-9]+(\.[0-9]+)?(-(pre|rc)[0-9]+)?|[0-9]{2}w[0-9]{2}[a-z])$/i;
+const MAX_MODPACK_NAME_LENGTH = 80;
+
 // --- Crear modpack ---
 router.post('/', (req, res) => {
-    const { name, mc_version } = req.body;
+    const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
+    const mc_version = typeof req.body.mc_version === 'string' ? req.body.mc_version.trim() : '';
     const loader = LOADERS.includes(req.body.loader) ? req.body.loader : 'vanilla';
     // La versión del loader es opcional: si no se manda (o el loader es
     // vanilla), el launcher resolverá la recomendada automáticamente al
@@ -103,6 +180,12 @@ router.post('/', (req, res) => {
         ? req.body.loader_version.trim()
         : '';
     if (!name || !mc_version) return res.status(400).json({ error: 'Faltan "name" o "mc_version".' });
+    if (name.length > MAX_MODPACK_NAME_LENGTH) {
+        return res.status(400).json({ error: `El nombre no puede superar los ${MAX_MODPACK_NAME_LENGTH} caracteres.` });
+    }
+    if (!MC_VERSION_RE.test(mc_version)) {
+        return res.status(400).json({ error: `"${mc_version}" no parece una versión válida de Minecraft (ej: 1.21.1, 24w14a).` });
+    }
 
     const id = crypto.randomUUID();
     const now = Date.now();
@@ -118,13 +201,19 @@ router.post('/', (req, res) => {
 });
 
 // --- Mis modpacks (los que creé + los que me han compartido) ---
+// MAX_MODPACKS_PER_SIDE limita el peor caso (una cuenta con cientos de
+// modpacks propios/compartidos) sin necesitar que el launcher mande
+// limit/offset: es un techo de seguridad, no paginación completa.
+const MAX_MODPACKS_PER_SIDE = 200;
 router.get('/mine', (req, res) => {
-    const owned = db.prepare('SELECT * FROM modpacks WHERE owner_uuid = ?').all(req.user.uuid);
+    const owned = db.prepare('SELECT * FROM modpacks WHERE owner_uuid = ? ORDER BY updated_at DESC LIMIT ?')
+        .all(req.user.uuid, MAX_MODPACKS_PER_SIDE);
     const shared = db.prepare(`
         SELECT m.* FROM modpacks m
         INNER JOIN access a ON a.modpack_id = m.id
         WHERE a.user_uuid = ? AND m.owner_uuid != ?
-    `).all(req.user.uuid, req.user.uuid);
+        ORDER BY m.updated_at DESC LIMIT ?
+    `).all(req.user.uuid, req.user.uuid, MAX_MODPACKS_PER_SIDE);
 
     res.json({
         owned: owned.map(p => ({ ...p, is_owner: true })),
@@ -136,7 +225,7 @@ router.get('/mine', (req, res) => {
 router.get('/:id/manifest', requireAccess, (req, res) => {
     const pack = db.prepare('SELECT * FROM modpacks WHERE id = ?').get(req.params.id);
     if (!pack) return res.status(404).json({ error: 'Modpack no encontrado.' });
-    const mods = db.prepare('SELECT id, filename, filesize, sha1, type, source, download_url FROM mods WHERE modpack_id = ?').all(pack.id);
+    const mods = db.prepare('SELECT id, filename, filesize, sha1, type, source, download_url, optional FROM mods WHERE modpack_id = ?').all(pack.id);
     res.json({
         id: pack.id,
         name: pack.name,
@@ -152,20 +241,34 @@ router.get('/:id/manifest', requireAccess, (req, res) => {
 // El campo "type" debe ir ANTES del archivo en el FormData: multer procesa
 // el multipart en orden y solo los campos ya vistos están en req.body
 // cuando se ejecuta fileFilter.
-router.post('/:id/mods', requireOwner, upload.single('mod'), async (req, res) => {
+router.post('/:id/mods', requireOwner, enforceUploadQuota, upload.single('mod'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Falta el archivo del mod (campo "mod").' });
     const type = MOD_TYPES.includes(req.body.type) ? req.body.type : 'mod';
+    const optional = req.body.optional === 'true' || req.body.optional === '1' ? 1 : 0;
 
     try {
         const sha1 = await sha1File(req.file.path);
+        const modIdentifier = type === 'mod' ? extractModId(req.file.path) : null;
+
+        if (modIdentifier) {
+            const conflict = db.prepare('SELECT filename FROM mods WHERE modpack_id = ? AND mod_identifier = ?')
+                .get(req.params.id, modIdentifier);
+            if (conflict) {
+                fs.unlink(req.file.path, () => {});
+                return res.status(409).json({
+                    error: `Este modpack ya tiene un mod con el mismo modid ("${modIdentifier}"): ${conflict.filename}. Quítalo antes de añadir este.`
+                });
+            }
+        }
+
         const modId = crypto.randomUUID();
         db.prepare(`
-            INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, added_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(modId, req.params.id, req.file.filename, req.file.size, sha1, type, Date.now());
+            INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, mod_identifier, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(modId, req.params.id, req.file.filename, req.file.size, sha1, type, optional, modIdentifier || '', Date.now());
 
         const versionHash = recomputeVersionHash(req.params.id);
-        res.json({ id: modId, filename: req.file.filename, filesize: req.file.size, sha1, type, version_hash: versionHash });
+        res.json({ id: modId, filename: req.file.filename, filesize: req.file.size, sha1, type, optional: !!optional, version_hash: versionHash });
     } catch (err) {
         console.error('[ERROR] al procesar el mod subido:', err);
         res.status(500).json({ error: 'No se pudo procesar el archivo subido.' });
@@ -176,9 +279,10 @@ router.post('/:id/mods', requireOwner, upload.single('mod'), async (req, res) =>
 // El cliente solo manda IDs; nunca confiamos en nombre/tamaño/hash que venga
 // del launcher. Volvemos a pedirle los datos reales a la API de Modrinth
 // (pública, sin key) y guardamos eso.
-router.post('/:id/mods/from-modrinth', requireOwner, async (req, res) => {
+router.post('/:id/mods/from-modrinth', requireOwner, enforceModCountLimit, async (req, res) => {
     const { project_id, version_id } = req.body || {};
     const type = MOD_TYPES.includes(req.body.type) ? req.body.type : 'mod';
+    const optional = req.body.optional === true || req.body.optional === 'true' ? 1 : 0;
     if (!project_id || !version_id) return res.status(400).json({ error: 'Faltan "project_id" o "version_id".' });
 
     let version;
@@ -205,12 +309,47 @@ router.post('/:id/mods/from-modrinth', requireOwner, async (req, res) => {
 
     const modId = crypto.randomUUID();
     db.prepare(`
-        INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, source, download_url, external_project_id, external_version_id, added_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'modrinth', ?, ?, ?, ?)
-    `).run(modId, req.params.id, file.filename, file.size, file.hashes.sha1, type, file.url, project_id, version_id, Date.now());
+        INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, source, download_url, external_project_id, external_version_id, added_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'modrinth', ?, ?, ?, ?)
+    `).run(modId, req.params.id, file.filename, file.size, file.hashes.sha1, type, optional, file.url, project_id, version_id, Date.now());
 
     const versionHash = recomputeVersionHash(req.params.id);
-    res.json({ id: modId, filename: file.filename, filesize: file.size, sha1: file.hashes.sha1, type, source: 'modrinth', version_hash: versionHash });
+    res.json({ id: modId, filename: file.filename, filesize: file.size, sha1: file.hashes.sha1, type, optional: !!optional, source: 'modrinth', version_hash: versionHash });
+});
+
+// --- Comprobar si hay una versión más nueva en Modrinth (solo el dueño) ---
+// Solo tiene sentido para mods añadidos desde Modrinth (source='modrinth');
+// los subidos a mano no tienen forma de saber si hay una versión nueva.
+router.get('/:id/mods/:modId/check-update', requireOwner, async (req, res) => {
+    const mod = db.prepare('SELECT * FROM mods WHERE id = ? AND modpack_id = ?').get(req.params.modId, req.params.id);
+    if (!mod) return res.status(404).json({ error: 'Mod no encontrado.' });
+    if (mod.source !== 'modrinth' || !mod.external_project_id) {
+        return res.status(400).json({ error: 'Este mod no se añadió desde Modrinth, no se puede comprobar su versión.' });
+    }
+
+    const pack = db.prepare('SELECT mc_version, loader FROM modpacks WHERE id = ?').get(req.params.id);
+
+    try {
+        const versionsRes = await fetch(
+            `https://api.modrinth.com/v2/project/${encodeURIComponent(mod.external_project_id)}/version?game_versions=["${encodeURIComponent(pack.mc_version)}"]&loaders=["${encodeURIComponent(pack.loader)}"]`,
+            { headers: { 'User-Agent': 'EmberLauncher/1.0 (github.com/HCuadrado428/Launcher)' } }
+        );
+        if (!versionsRes.ok) return res.status(502).json({ error: `Modrinth respondió con estado ${versionsRes.status}.` });
+        const versions = await versionsRes.json();
+        const latest = versions[0]; // Modrinth los devuelve ordenados de más reciente a más antiguo
+        if (!latest) {
+            return res.json({ has_update: false, reason: 'No hay ninguna versión de este mod compatible con la versión de Minecraft/loader del modpack.' });
+        }
+        res.json({
+            has_update: latest.id !== mod.external_version_id,
+            current_version_id: mod.external_version_id,
+            latest_version_id: latest.id,
+            latest_version_number: latest.version_number
+        });
+    } catch (err) {
+        console.error('[ERROR] al comprobar actualización en Modrinth:', err);
+        res.status(502).json({ error: 'No se pudo contactar con Modrinth.' });
+    }
 });
 
 // --- Quitar mod (solo el dueño) ---

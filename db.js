@@ -74,5 +74,14 @@ ensureColumn('mods', 'source', "TEXT NOT NULL DEFAULT 'upload'");
 ensureColumn('mods', 'download_url', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('mods', 'external_project_id', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('mods', 'external_version_id', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('mods', 'optional', "INTEGER NOT NULL DEFAULT 0");
+ensureColumn('mods', 'mod_identifier', "TEXT NOT NULL DEFAULT ''");
+
+// mods.modpack_id se consulta en cada manifiesto/sincronización/lanzamiento
+// (una por jugador conectado); access.user_uuid se consulta en /mine. Sin
+// índice, ambas fuerzan un table scan que crece con cada modpack/usuario nuevo.
+db.exec('CREATE INDEX IF NOT EXISTS idx_mods_modpack_id ON mods(modpack_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_access_user_uuid ON access(user_uuid);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_invites_modpack_id ON invites(modpack_id);');
 
 module.exports = db;
