@@ -6,7 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const AdmZip = require('adm-zip');
 const db = require('../db');
-const { requireAuth } = require('../auth');
+const { requireAuth, requirePremium } = require('../auth');
 
 const STORAGE_DIR = process.env.STORAGE_DIR || path.join(__dirname, '..', 'storage');
 
@@ -132,6 +132,34 @@ function recomputeVersionHash(modpackId) {
     db.prepare('UPDATE modpacks SET version_hash = ?, updated_at = ? WHERE id = ?')
         .run(hash, Date.now(), modpackId);
     return hash;
+}
+
+// Guarda una "foto" de la lista de mods tal cual está justo ANTES de
+// aplicar un cambio (añadir/quitar un mod), para poder volver a ese estado
+// si una edición posterior rompe el modpack para todos los que sincronizan.
+// Se limita a las últimas MAX_VERSION_SNAPSHOTS por modpack para no crecer
+// sin límite.
+const MAX_VERSION_SNAPSHOTS = 15;
+function snapshotModpackVersion(modpackId) {
+    const pack = db.prepare('SELECT version_hash FROM modpacks WHERE id = ?').get(modpackId);
+    if (!pack) return;
+    const mods = db.prepare(`
+        SELECT id, filename, filesize, sha1, type, optional, source, download_url,
+               external_project_id, external_version_id, mod_identifier
+        FROM mods WHERE modpack_id = ?
+    `).all(modpackId);
+
+    db.prepare(`
+        INSERT INTO modpack_versions (id, modpack_id, version_hash, mods_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    `).run(crypto.randomUUID(), modpackId, pack.version_hash, JSON.stringify(mods), Date.now());
+
+    const excess = db.prepare(`
+        SELECT id FROM modpack_versions WHERE modpack_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ?
+    `).all(modpackId, MAX_VERSION_SNAPSHOTS);
+    for (const row of excess) {
+        db.prepare('DELETE FROM modpack_versions WHERE id = ?').run(row.id);
+    }
 }
 
 // Distinguimos "el modpack no existe" (404, p.ej. porque el creador lo
@@ -261,6 +289,7 @@ router.post('/:id/mods', requireOwner, enforceUploadQuota, upload.single('mod'),
             }
         }
 
+        snapshotModpackVersion(req.params.id);
         const modId = crypto.randomUUID();
         db.prepare(`
             INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, mod_identifier, added_at)
@@ -307,6 +336,33 @@ router.post('/:id/mods/from-modrinth', requireOwner, enforceModCountLimit, async
         .get(req.params.id, project_id, 'modrinth');
     if (existing) return res.status(409).json({ error: 'Ese mod de Modrinth ya está en el modpack.' });
 
+    // Modrinth incluye las dependencias de cada versión (p.ej. Sodium
+    // necesita Fabric API). Antes esto no se comprobaba: el mod se añadía
+    // igualmente y el fallo solo se veía al lanzar el juego, sin ninguna
+    // pista de qué faltaba. Aquí solo avisamos (no bloqueamos ni añadimos
+    // nada automáticamente) de las dependencias obligatorias que falten.
+    let missingDependencies = [];
+    const requiredDeps = (version.dependencies || []).filter((d) => d.dependency_type === 'required' && d.project_id);
+    if (requiredDeps.length) {
+        const existingProjectIds = new Set(
+            db.prepare('SELECT external_project_id FROM mods WHERE modpack_id = ?').all(req.params.id).map((m) => m.external_project_id)
+        );
+        const missingDeps = requiredDeps.filter((d) => !existingProjectIds.has(d.project_id));
+        missingDependencies = await Promise.all(missingDeps.map(async (d) => {
+            try {
+                const r = await fetch(`https://api.modrinth.com/v2/project/${encodeURIComponent(d.project_id)}`, {
+                    headers: { 'User-Agent': 'EmberLauncher/1.0 (github.com/HCuadrado428/Launcher)' }
+                });
+                if (!r.ok) return d.project_id;
+                const p = await r.json();
+                return p.title || d.project_id;
+            } catch (err) {
+                return d.project_id;
+            }
+        }));
+    }
+
+    snapshotModpackVersion(req.params.id);
     const modId = crypto.randomUUID();
     db.prepare(`
         INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, source, download_url, external_project_id, external_version_id, added_at)
@@ -314,7 +370,10 @@ router.post('/:id/mods/from-modrinth', requireOwner, enforceModCountLimit, async
     `).run(modId, req.params.id, file.filename, file.size, file.hashes.sha1, type, optional, file.url, project_id, version_id, Date.now());
 
     const versionHash = recomputeVersionHash(req.params.id);
-    res.json({ id: modId, filename: file.filename, filesize: file.size, sha1: file.hashes.sha1, type, optional: !!optional, source: 'modrinth', version_hash: versionHash });
+    res.json({
+        id: modId, filename: file.filename, filesize: file.size, sha1: file.hashes.sha1, type,
+        optional: !!optional, source: 'modrinth', version_hash: versionHash, missing_dependencies: missingDependencies
+    });
 });
 
 // --- Comprobar si hay una versión más nueva en Modrinth (solo el dueño) ---
@@ -357,12 +416,55 @@ router.delete('/:id/mods/:modId', requireOwner, (req, res) => {
     const mod = db.prepare('SELECT * FROM mods WHERE id = ? AND modpack_id = ?').get(req.params.modId, req.params.id);
     if (!mod) return res.status(404).json({ error: 'Mod no encontrado.' });
 
+    snapshotModpackVersion(req.params.id);
     const filePath = path.join(modpackDir(req.params.id), mod.filename);
     fs.unlink(filePath, () => {}); // si ya no está en disco, no pasa nada
 
     db.prepare('DELETE FROM mods WHERE id = ?').run(mod.id);
     const versionHash = recomputeVersionHash(req.params.id);
     res.json({ ok: true, version_hash: versionHash });
+});
+
+// --- Historial de versiones (solo el dueño) ---
+router.get('/:id/versions', requireOwner, (req, res) => {
+    const versions = db.prepare(`
+        SELECT id, version_hash, created_at, mods_json FROM modpack_versions
+        WHERE modpack_id = ? ORDER BY created_at DESC
+    `).all(req.params.id);
+    res.json(versions.map((v) => ({
+        id: v.id,
+        version_hash: v.version_hash,
+        created_at: v.created_at,
+        mod_count: JSON.parse(v.mods_json).length
+    })));
+});
+
+// --- Restaurar una versión anterior (solo el dueño) ---
+// Reemplaza la lista de mods actual por la guardada en el snapshot. Los
+// archivos en disco de los mods que ya no estaban no se han borrado (los
+// añadidos después del snapshot si se han quitado desde entonces, sí), así
+// que restaurar siempre funciona con lo que hay en el snapshot, aunque el
+// mod se hubiera eliminado más tarde.
+router.post('/:id/versions/:versionId/restore', requireOwner, (req, res) => {
+    const snapshot = db.prepare('SELECT * FROM modpack_versions WHERE id = ? AND modpack_id = ?').get(req.params.versionId, req.params.id);
+    if (!snapshot) return res.status(404).json({ error: 'Esa versión del historial no existe.' });
+
+    snapshotModpackVersion(req.params.id);
+    const mods = JSON.parse(snapshot.mods_json);
+    db.prepare('DELETE FROM mods WHERE modpack_id = ?').run(req.params.id);
+    for (const m of mods) {
+        db.prepare(`
+            INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, source, download_url, external_project_id, external_version_id, mod_identifier, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            m.id, req.params.id, m.filename, m.filesize, m.sha1, m.type, m.optional ? 1 : 0,
+            m.source || 'upload', m.download_url || '', m.external_project_id || '', m.external_version_id || '',
+            m.mod_identifier || '', Date.now()
+        );
+    }
+
+    const versionHash = recomputeVersionHash(req.params.id);
+    res.json({ ok: true, version_hash: versionHash, restored_mod_count: mods.length });
 });
 
 // --- Descargar un mod (cualquiera con acceso al modpack) ---
@@ -394,9 +496,24 @@ router.put('/:id/cover', requireOwner, (req, res) => {
     res.json({ ok: true });
 });
 
-// --- Crear link de invitación (solo el dueño) ---
-router.post('/:id/invite', requireOwner, (req, res) => {
+// --- Crear link de invitación (solo el dueño, y solo cuentas premium) ---
+// Compartir modpacks es lo único que se reserva a cuentas de Microsoft
+// verificadas; crear modpacks propios y unirse a los de otros (redeem, en
+// inviteRoutes.js) sigue abierto a cualquier cuenta, offline incluida.
+router.post('/:id/invite', requireOwner, requirePremium, (req, res) => {
     const { max_uses, expires_in_hours } = req.body || {};
+
+    if (max_uses !== undefined && max_uses !== null) {
+        if (!Number.isInteger(max_uses) || max_uses < 1) {
+            return res.status(400).json({ error: '"max_uses" debe ser un número entero positivo.' });
+        }
+    }
+    if (expires_in_hours !== undefined && expires_in_hours !== null) {
+        if (typeof expires_in_hours !== 'number' || !Number.isFinite(expires_in_hours) || expires_in_hours <= 0) {
+            return res.status(400).json({ error: '"expires_in_hours" debe ser un número positivo.' });
+        }
+    }
+
     const token = crypto.randomBytes(16).toString('hex');
     const now = Date.now();
     const expiresAt = expires_in_hours ? now + expires_in_hours * 3600 * 1000 : null;
@@ -407,6 +524,45 @@ router.post('/:id/invite', requireOwner, (req, res) => {
     `).run(token, req.params.id, req.user.uuid, max_uses || null, expiresAt, now);
 
     res.json({ token, url: `milauncher://invite/${token}` });
+});
+
+// --- Listar invitaciones vigentes (solo el dueño) ---
+router.get('/:id/invites', requireOwner, (req, res) => {
+    const invites = db.prepare(`
+        SELECT token, max_uses, uses, expires_at, created_at FROM invites
+        WHERE modpack_id = ? ORDER BY created_at DESC
+    `).all(req.params.id);
+    res.json(invites);
+});
+
+// --- Revocar una invitación antes de que se use/caduque (solo el dueño) ---
+router.delete('/:id/invites/:token', requireOwner, (req, res) => {
+    const result = db.prepare('DELETE FROM invites WHERE token = ? AND modpack_id = ?').run(req.params.token, req.params.id);
+    if (result.changes === 0) return res.status(404).json({ error: 'Esa invitación no existe.' });
+    res.json({ ok: true });
+});
+
+// --- Ver quién tiene acceso a un modpack compartido (solo el dueño) ---
+router.get('/:id/access', requireOwner, (req, res) => {
+    const users = db.prepare(`
+        SELECT a.user_uuid AS uuid, u.username, a.granted_at
+        FROM access a
+        LEFT JOIN users u ON u.uuid = a.user_uuid
+        WHERE a.modpack_id = ? AND a.user_uuid != (SELECT owner_uuid FROM modpacks WHERE id = ?)
+        ORDER BY a.granted_at DESC
+    `).all(req.params.id, req.params.id);
+    res.json(users);
+});
+
+// --- Revocar el acceso de un usuario concreto (solo el dueño) ---
+router.delete('/:id/access/:uuid', requireOwner, (req, res) => {
+    const pack = db.prepare('SELECT owner_uuid FROM modpacks WHERE id = ?').get(req.params.id);
+    if (pack && pack.owner_uuid === req.params.uuid) {
+        return res.status(400).json({ error: 'No puedes quitarte el acceso a ti mismo como creador.' });
+    }
+    const result = db.prepare('DELETE FROM access WHERE modpack_id = ? AND user_uuid = ?').run(req.params.id, req.params.uuid);
+    if (result.changes === 0) return res.status(404).json({ error: 'Ese usuario no tenía acceso.' });
+    res.json({ ok: true });
 });
 
 // --- Eliminar modpack (solo el dueño) ---

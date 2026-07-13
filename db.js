@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS access (
   granted_at INTEGER NOT NULL,
   PRIMARY KEY (modpack_id, user_uuid)
 );
+
+-- Una fila por cada vez que cambia la lista de mods de un modpack (se
+-- guarda antes de aplicar el cambio, como snapshot del estado anterior).
+-- Permite al dueño ver el historial y volver a un estado previo si una
+-- edición rompe el modpack para todos los que lo sincronizan.
+CREATE TABLE IF NOT EXISTS modpack_versions (
+  id TEXT PRIMARY KEY,
+  modpack_id TEXT NOT NULL,
+  version_hash TEXT NOT NULL,
+  mods_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (modpack_id) REFERENCES modpacks(id)
+);
 `);
 
 // Migración no destructiva: añade columnas nuevas a bases de datos que ya
@@ -76,6 +89,15 @@ ensureColumn('mods', 'external_project_id', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('mods', 'external_version_id', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('mods', 'optional', "INTEGER NOT NULL DEFAULT 0");
 ensureColumn('mods', 'mod_identifier', "TEXT NOT NULL DEFAULT ''");
+// premium: 1 = cuenta de Minecraft verificada por Microsoft, 0 = cuenta
+// offline (local/"no premium"). Las filas ya existentes son todas de antes
+// de este cambio, es decir, todas verificadas por Microsoft: DEFAULT 1 las
+// deja correctamente marcadas como premium sin tener que migrar nada a mano.
+ensureColumn('users', 'premium', 'INTEGER NOT NULL DEFAULT 1');
+// Se incrementa en cada logout explícito; los JWT llevan el valor vigente en
+// el momento de firmarlos ("tv") y requireAuth los rechaza si no coincide,
+// lo que permite invalidar sesiones ya emitidas sin esperar a que caduquen.
+ensureColumn('users', 'token_version', 'INTEGER NOT NULL DEFAULT 0');
 
 // mods.modpack_id se consulta en cada manifiesto/sincronización/lanzamiento
 // (una por jugador conectado); access.user_uuid se consulta en /mine. Sin
@@ -83,5 +105,6 @@ ensureColumn('mods', 'mod_identifier', "TEXT NOT NULL DEFAULT ''");
 db.exec('CREATE INDEX IF NOT EXISTS idx_mods_modpack_id ON mods(modpack_id);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_access_user_uuid ON access(user_uuid);');
 db.exec('CREATE INDEX IF NOT EXISTS idx_invites_modpack_id ON invites(modpack_id);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_modpack_versions_modpack_id ON modpack_versions(modpack_id);');
 
 module.exports = db;
