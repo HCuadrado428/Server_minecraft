@@ -52,12 +52,17 @@ const upload = multer({
 const MAX_BYTES_PER_OWNER = 5 * 1024 * 1024 * 1024; // 5GB en total, sumando todos los modpacks de un mismo creador
 const MAX_MODS_PER_MODPACK = 300;
 
+// Los mods con source='modrinth' nunca se suben a STORAGE_DIR (solo se
+// guarda su download_url, el archivo real vive en la CDN de Modrinth), así
+// que no deben contar contra la cuota de disco del servidor. Antes sí se
+// sumaban, lo que podía bloquear subidas reales a alguien que solo hubiera
+// añadido mods grandes desde Modrinth sin haber ocupado nada de verdad.
 function getOwnerStorageBytes(ownerUuid) {
     const row = db.prepare(`
         SELECT COALESCE(SUM(mo.filesize), 0) AS total
         FROM mods mo
         INNER JOIN modpacks mp ON mp.id = mo.modpack_id
-        WHERE mp.owner_uuid = ?
+        WHERE mp.owner_uuid = ? AND mo.source != 'modrinth'
     `).get(ownerUuid);
     return row.total;
 }
@@ -185,6 +190,12 @@ function requireOwner(req, res, next) {
 }
 
 router.use(requireAuth);
+
+// --- Cuánto espacio ocupa el usuario, para mostrar una barra de uso en el
+// launcher antes de que se tope con el 413 al subir algo. ---
+router.get('/storage', (req, res) => {
+    res.json({ used_bytes: getOwnerStorageBytes(req.user.uuid), limit_bytes: MAX_BYTES_PER_OWNER });
+});
 
 const LOADERS = ['vanilla', 'forge', 'fabric'];
 
@@ -441,18 +452,29 @@ router.get('/:id/versions', requireOwner, (req, res) => {
 
 // --- Restaurar una versión anterior (solo el dueño) ---
 // Reemplaza la lista de mods actual por la guardada en el snapshot. Los
-// archivos en disco de los mods que ya no estaban no se han borrado (los
-// añadidos después del snapshot si se han quitado desde entonces, sí), así
-// que restaurar siempre funciona con lo que hay en el snapshot, aunque el
-// mod se hubiera eliminado más tarde.
+// mods de Modrinth siempre se pueden restaurar (se resuelven por su
+// download_url externa), pero un mod subido a mano cuyo archivo ya se borró
+// físicamente de STORAGE_DIR (porque se quitó del modpack después de este
+// snapshot) no se puede traer de vuelta: no hay ninguna copia guardada del
+// binario, solo sus metadatos. Antes se reinsertaba igualmente la fila y el
+// launcher de cada jugador fallaba al intentar descargarlo, sin ningún
+// aviso de qué había pasado. Ahora esos mods se saltan y se informa cuáles.
 router.post('/:id/versions/:versionId/restore', requireOwner, (req, res) => {
     const snapshot = db.prepare('SELECT * FROM modpack_versions WHERE id = ? AND modpack_id = ?').get(req.params.versionId, req.params.id);
     if (!snapshot) return res.status(404).json({ error: 'Esa versión del historial no existe.' });
 
     snapshotModpackVersion(req.params.id);
     const mods = JSON.parse(snapshot.mods_json);
+    const skipped = [];
+    const restorable = mods.filter((m) => {
+        if (m.source === 'modrinth') return true;
+        const exists = fs.existsSync(path.join(modpackDir(req.params.id), m.filename));
+        if (!exists) skipped.push(m.filename);
+        return exists;
+    });
+
     db.prepare('DELETE FROM mods WHERE modpack_id = ?').run(req.params.id);
-    for (const m of mods) {
+    for (const m of restorable) {
         db.prepare(`
             INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, source, download_url, external_project_id, external_version_id, mod_identifier, added_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -464,7 +486,7 @@ router.post('/:id/versions/:versionId/restore', requireOwner, (req, res) => {
     }
 
     const versionHash = recomputeVersionHash(req.params.id);
-    res.json({ ok: true, version_hash: versionHash, restored_mod_count: mods.length });
+    res.json({ ok: true, version_hash: versionHash, restored_mod_count: restorable.length, skipped_files: skipped });
 });
 
 // --- Descargar un mod (cualquiera con acceso al modpack) ---
@@ -562,6 +584,19 @@ router.delete('/:id/access/:uuid', requireOwner, (req, res) => {
     }
     const result = db.prepare('DELETE FROM access WHERE modpack_id = ? AND user_uuid = ?').run(req.params.id, req.params.uuid);
     if (result.changes === 0) return res.status(404).json({ error: 'Ese usuario no tenía acceso.' });
+    res.json({ ok: true });
+});
+
+// --- Abandonar un modpack compartido (cualquiera con acceso, menos el dueño) ---
+// Antes de esto, la única forma de que un jugador dejara de tener un
+// modpack compartido en su lista era que el DUEÑO le revocara el acceso a
+// mano; el propio jugador no tenía ninguna forma de quitárselo de encima.
+router.post('/:id/leave', requireAccess, (req, res) => {
+    const pack = db.prepare('SELECT owner_uuid FROM modpacks WHERE id = ?').get(req.params.id);
+    if (pack.owner_uuid === req.user.uuid) {
+        return res.status(400).json({ error: 'Eres el creador de este modpack: no puedes abandonarlo, pero puedes eliminarlo si ya no lo quieres.' });
+    }
+    db.prepare('DELETE FROM access WHERE modpack_id = ? AND user_uuid = ?').run(req.params.id, req.user.uuid);
     res.json({ ok: true });
 });
 
