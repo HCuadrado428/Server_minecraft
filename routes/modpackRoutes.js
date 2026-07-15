@@ -473,6 +473,19 @@ router.post('/:id/versions/:versionId/restore', requireOwner, (req, res) => {
         return exists;
     });
 
+    // Los mods actuales (no los del snapshot) que no vayan a seguir
+    // existiendo después de restaurar se borran también de disco. Si no,
+    // el archivo se queda huérfano en STORAGE_DIR para siempre: ni cuenta
+    // para la cuota (se calcula sobre la tabla "mods", que ya no lo
+    // referencia) ni hay ningún otro sitio que lo limpie.
+    const restorableFilenames = new Set(restorable.filter((m) => m.source !== 'modrinth').map((m) => m.filename));
+    const currentUploads = db.prepare("SELECT filename FROM mods WHERE modpack_id = ? AND source != 'modrinth'").all(req.params.id);
+    for (const { filename } of currentUploads) {
+        if (!restorableFilenames.has(filename)) {
+            fs.unlink(path.join(modpackDir(req.params.id), filename), () => {});
+        }
+    }
+
     db.prepare('DELETE FROM mods WHERE modpack_id = ?').run(req.params.id);
     for (const m of restorable) {
         db.prepare(`
@@ -522,17 +535,19 @@ router.put('/:id/cover', requireOwner, (req, res) => {
 // Compartir modpacks es lo único que se reserva a cuentas de Microsoft
 // verificadas; crear modpacks propios y unirse a los de otros (redeem, en
 // inviteRoutes.js) sigue abierto a cualquier cuenta, offline incluida.
+const MAX_INVITE_USES = 10000;
+const MAX_INVITE_EXPIRES_HOURS = 24 * 365; // 1 año
 router.post('/:id/invite', requireOwner, requirePremium, (req, res) => {
     const { max_uses, expires_in_hours } = req.body || {};
 
     if (max_uses !== undefined && max_uses !== null) {
-        if (!Number.isInteger(max_uses) || max_uses < 1) {
-            return res.status(400).json({ error: '"max_uses" debe ser un número entero positivo.' });
+        if (!Number.isInteger(max_uses) || max_uses < 1 || max_uses > MAX_INVITE_USES) {
+            return res.status(400).json({ error: `"max_uses" debe ser un número entero entre 1 y ${MAX_INVITE_USES}.` });
         }
     }
     if (expires_in_hours !== undefined && expires_in_hours !== null) {
-        if (typeof expires_in_hours !== 'number' || !Number.isFinite(expires_in_hours) || expires_in_hours <= 0) {
-            return res.status(400).json({ error: '"expires_in_hours" debe ser un número positivo.' });
+        if (typeof expires_in_hours !== 'number' || !Number.isFinite(expires_in_hours) || expires_in_hours <= 0 || expires_in_hours > MAX_INVITE_EXPIRES_HOURS) {
+            return res.status(400).json({ error: `"expires_in_hours" debe ser un número positivo de hasta ${MAX_INVITE_EXPIRES_HOURS} horas (1 año).` });
         }
     }
 
