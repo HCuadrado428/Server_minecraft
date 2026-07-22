@@ -18,6 +18,30 @@ function ensureDir(dir) {
     fs.mkdirSync(dir, { recursive: true });
 }
 
+// Igual que el filename callback de multer más abajo. Los mods subidos a
+// mano ya pasaban por esto; los añadidos desde Modrinth usaban el
+// "filename" que devuelve la API de Modrinth tal cual, sin sanear. Como
+// cualquiera puede publicar un proyecto en Modrinth, un "filename" con
+// "../" permitía escribir/leer fuera de la carpeta del modpack (path
+// traversal). Se aplica también en resolveModpackFilePath como segunda
+// barrera para filas ya guardadas antes de este fix.
+function sanitizeFilename(name) {
+    return String(name || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+// Resuelve la ruta de un archivo de modpack asegurando que se queda dentro
+// de modpackDir(id). Sin esto, un filename malicioso o corrupto en la DB
+// (ver sanitizeFilename) podría hacer que download/delete/restore lean o
+// borren algo fuera de la carpeta del modpack.
+function resolveModpackFilePath(modpackId, filename) {
+    const dir = modpackDir(modpackId);
+    const resolved = path.resolve(dir, filename);
+    if (resolved !== dir && !resolved.startsWith(dir + path.sep)) {
+        throw new Error('Nombre de archivo inválido.');
+    }
+    return resolved;
+}
+
 const MOD_TYPES = ['mod', 'resourcepack'];
 const EXTENSION_BY_TYPE = { mod: '.jar', resourcepack: '.zip' };
 
@@ -373,18 +397,29 @@ router.post('/:id/mods/from-modrinth', requireOwner, enforceModCountLimit, async
         }));
     }
 
-    snapshotModpackVersion(req.params.id);
-    const modId = crypto.randomUUID();
-    db.prepare(`
-        INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, source, download_url, external_project_id, external_version_id, added_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'modrinth', ?, ?, ?, ?)
-    `).run(modId, req.params.id, file.filename, file.size, file.hashes.sha1, type, optional, file.url, project_id, version_id, Date.now());
+    const safeFilename = sanitizeFilename(file.filename);
 
-    const versionHash = recomputeVersionHash(req.params.id);
-    res.json({
-        id: modId, filename: file.filename, filesize: file.size, sha1: file.hashes.sha1, type,
-        optional: !!optional, source: 'modrinth', version_hash: versionHash, missing_dependencies: missingDependencies
-    });
+    try {
+        snapshotModpackVersion(req.params.id);
+        const modId = crypto.randomUUID();
+        db.prepare(`
+            INSERT INTO mods (id, modpack_id, filename, filesize, sha1, type, optional, source, download_url, external_project_id, external_version_id, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'modrinth', ?, ?, ?, ?)
+        `).run(modId, req.params.id, safeFilename, file.size, file.hashes.sha1, type, optional, file.url, project_id, version_id, Date.now());
+
+        const versionHash = recomputeVersionHash(req.params.id);
+        res.json({
+            id: modId, filename: safeFilename, filesize: file.size, sha1: file.hashes.sha1, type,
+            optional: !!optional, source: 'modrinth', version_hash: versionHash, missing_dependencies: missingDependencies
+        });
+    } catch (err) {
+        // Antes esta parte no tenía try/catch: un error aquí (p.ej. Modrinth
+        // devolviendo un objeto sin hashes.sha1, que violaría el NOT NULL de
+        // la columna) se convertía en un unhandled rejection que tumbaba
+        // TODO el proceso de Node, no solo esta petición.
+        console.error('[ERROR] al guardar el mod de Modrinth:', err);
+        res.status(500).json({ error: 'No se pudo guardar el mod de Modrinth.' });
+    }
 });
 
 // --- Comprobar si hay una versión más nueva en Modrinth (solo el dueño) ---
@@ -428,7 +463,7 @@ router.delete('/:id/mods/:modId', requireOwner, (req, res) => {
     if (!mod) return res.status(404).json({ error: 'Mod no encontrado.' });
 
     snapshotModpackVersion(req.params.id);
-    const filePath = path.join(modpackDir(req.params.id), mod.filename);
+    const filePath = resolveModpackFilePath(req.params.id, mod.filename);
     fs.unlink(filePath, () => {}); // si ya no está en disco, no pasa nada
 
     db.prepare('DELETE FROM mods WHERE id = ?').run(mod.id);
@@ -468,7 +503,7 @@ router.post('/:id/versions/:versionId/restore', requireOwner, (req, res) => {
     const skipped = [];
     const restorable = mods.filter((m) => {
         if (m.source === 'modrinth') return true;
-        const exists = fs.existsSync(path.join(modpackDir(req.params.id), m.filename));
+        const exists = fs.existsSync(resolveModpackFilePath(req.params.id, m.filename));
         if (!exists) skipped.push(m.filename);
         return exists;
     });
@@ -482,7 +517,7 @@ router.post('/:id/versions/:versionId/restore', requireOwner, (req, res) => {
     const currentUploads = db.prepare("SELECT filename FROM mods WHERE modpack_id = ? AND source != 'modrinth'").all(req.params.id);
     for (const { filename } of currentUploads) {
         if (!restorableFilenames.has(filename)) {
-            fs.unlink(path.join(modpackDir(req.params.id), filename), () => {});
+            fs.unlink(resolveModpackFilePath(req.params.id, filename), () => {});
         }
     }
 
@@ -506,7 +541,7 @@ router.post('/:id/versions/:versionId/restore', requireOwner, (req, res) => {
 router.get('/:id/mods/:modId/download', requireAccess, (req, res) => {
     const mod = db.prepare('SELECT * FROM mods WHERE id = ? AND modpack_id = ?').get(req.params.modId, req.params.id);
     if (!mod) return res.status(404).json({ error: 'Mod no encontrado.' });
-    const filePath = path.join(modpackDir(req.params.id), mod.filename);
+    const filePath = resolveModpackFilePath(req.params.id, mod.filename);
     res.download(filePath, mod.filename);
 });
 

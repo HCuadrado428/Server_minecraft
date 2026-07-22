@@ -9,6 +9,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -258,4 +259,72 @@ test('cerrar sesión invalida el token de inmediato', async () => {
 test('sin token de autenticación, las rutas de modpacks responden 401', async () => {
     const res = await fetch(`${BASE_URL}/api/modpacks/mine`);
     assert.equal(res.status, 401);
+});
+
+test('canjear la misma invitación dos veces con la misma cuenta no gasta dos usos', async () => {
+    const owner = await registerOffline('TestPremium4');
+    markPremium(owner.uuid);
+    const member = await registerOffline('TestMember2');
+
+    const createRes = await fetch(`${BASE_URL}/api/modpacks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${owner.token}` },
+        body: JSON.stringify({ name: 'Pack doble canje', mc_version: '1.21.1' })
+    });
+    const { id } = await createRes.json();
+
+    const inviteRes = await fetch(`${BASE_URL}/api/modpacks/${id}/invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${owner.token}` },
+        body: JSON.stringify({ max_uses: 1 })
+    });
+    const invite = await inviteRes.json();
+
+    const redeem1 = await fetch(`${BASE_URL}/api/invites/${invite.token}/redeem`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${member.token}` }
+    });
+    assert.equal(redeem1.status, 200);
+
+    // Redimir otra vez con la misma cuenta (un doble click en "unirse", o
+    // reabrir el mismo link) ya tiene acceso concedido: no debería gastar el
+    // único uso disponible del invite una segunda vez.
+    const redeem2 = await fetch(`${BASE_URL}/api/invites/${invite.token}/redeem`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${member.token}` }
+    });
+    assert.equal(redeem2.status, 200);
+
+    const listRes = await fetch(`${BASE_URL}/api/modpacks/${id}/invites`, {
+        headers: { Authorization: `Bearer ${owner.token}` }
+    });
+    const invites = await listRes.json();
+    assert.equal(invites[0].uses, 1);
+});
+
+test('un filename manipulado en la DB no permite escapar del directorio del modpack al descargar', async () => {
+    const { token } = await registerOffline('TestTraversal1');
+    const createRes = await fetch(`${BASE_URL}/api/modpacks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ name: 'Pack traversal', mc_version: '1.21.1' })
+    });
+    const { id } = await createRes.json();
+
+    // Simula una fila con un filename malicioso, como llegaría de una fuente
+    // externa no saneada (ver sanitizeFilename/resolveModpackFilePath en
+    // modpackRoutes.js). No pasa por la API real de Modrinth porque
+    // provocarlo de verdad requeriría controlar su respuesta.
+    const db = new DatabaseSync(dbPath);
+    const modId = crypto.randomUUID();
+    db.prepare(`
+        INSERT INTO mods (id, modpack_id, filename, filesize, sha1, added_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `).run(modId, id, '../../evil.txt', 10, 'deadbeef', Date.now());
+    db.close();
+
+    const downloadRes = await fetch(`${BASE_URL}/api/modpacks/${id}/mods/${modId}/download`, {
+        headers: { Authorization: `Bearer ${token}` }
+    });
+    assert.equal(downloadRes.status, 400);
 });

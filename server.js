@@ -50,6 +50,18 @@ app.use((err, req, res, next) => {
     res.status(400).json({ error: err.message || 'Petición inválida.' });
 });
 
+// Red de seguridad: si algún endpoint async se escapa sin capturar un error
+// (Express 4 no atrapa rejections de un handler async por su cuenta), Node
+// por defecto mata el proceso entero en vez de solo fallar esa petición.
+// Preferimos perder esa única respuesta y seguir sirviendo al resto de
+// launchers antes que tirar el servidor completo por un caso no previsto.
+process.on('unhandledRejection', (reason) => {
+    console.error('[UNHANDLED REJECTION]', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT EXCEPTION]', err);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`[OK] Servidor de modpacks escuchando en el puerto ${PORT}`);
